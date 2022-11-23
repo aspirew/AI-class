@@ -1,6 +1,6 @@
 from collections import namedtuple
 from functools import partial
-from random import random, choices, randint, randrange
+from random import random, sample, choices, randint, randrange, shuffle
 from typing import Callable, List, Tuple
 
 Genome = List[int]
@@ -62,28 +62,74 @@ def fitness(genome: Genome, things: List[Thing], weight_limit: int) -> int:
                 return 0            
     return value
 
-def selection(population: Population, fitness_func: FitnessFunc) -> Population:
+def roulette(population: Population, fitness_func: FitnessFunc) -> Population:
     return choices(
         population=population,
         weights=[fitness_func(genome) for genome in population],
         k=2
     )
     
-def single_point_crossover(a: Genome, b: Genome) -> Tuple[Genome, Genome]:
+def tournament(population: Population, fitness_func: FitnessFunc) -> Population:
+    size = randint(2, len(population)-1)
+    selected_population = population.copy()
+    shuffle(selected_population)
+
+    selected_population = sorted(
+        selected_population[0:size],
+        key = lambda genome: fitness_func(genome),
+        reverse = True
+    )
+    return selected_population[0:2]
+
+def k_point_crossover(a: Genome, b: Genome, k: int) -> Tuple[Genome, Genome]:
     if len(a) != len(b):
         raise ValueError("Genomes are of a different size")
     
     length = len(a)
-    if length < 2:
-        return a, b
+    if length < k - 1 or k < 1:
+        raise ValueError("Invalid k size")
     
-    p = randint(1, length - 1)
-    return a[0:p] + b[p:], b[0:p] + a[p:]
+    offspring_1 = []
+    offspring_2 = []
 
-def mutation(genome: Genome, num: int = 1, probability: float = MUTATION_PROBABILITY) -> Genome:
+    crossover_points = sorted(sample(population = range(1, length), k=k))
+    
+    last_index = 0
+    skip = False
+    
+    for index in crossover_points:
+        if not skip:
+            offspring_1 = offspring_1[:last_index] + a[last_index:index] + b[index:]
+            offspring_2 = offspring_2[:last_index] + b[last_index:index] + a[index:]
+        else:
+            offspring_1 = offspring_1[:last_index] + a[last_index:]
+            offspring_2 = offspring_2[:last_index] + b[last_index:]
+        last_index = index
+        skip = not skip
+    if len(crossover_points) % 2 == 0:
+        temp_a = offspring_1.copy()
+        offspring_1 = offspring_1[0:last_index] + offspring_1[last_index:]
+        offspring_2 = offspring_2[0:last_index] + temp_a[last_index:]
+        
+    return offspring_1, offspring_2
+
+def flip_mutation(genome: Genome, num: int = 1, probability: float = MUTATION_PROBABILITY) -> Genome:
     for _ in range(num):
-        index = randrange(len(genome))
-        genome[index] = genome[index] if random() > probability else abs(genome[index] - 1)
+        if(random() < probability):
+            index = randrange(len(genome))
+            genome[index] = abs(genome[index] - 1)
+    return genome
+
+def inversion_mutation(genome: Genome, num: int = 1, probability: float = MUTATION_PROBABILITY) -> Genome:
+    length = len(genome)
+    for _ in range(num):
+        if random() < probability:
+            p1 = randint(1, length - 1)
+            p2 = randint(p1, length - 1)
+            inversed_part = genome[p1:p2]
+            inversed_part.reverse()
+            genome = genome[0:p1] + inversed_part + genome[p2:]
+
     return genome
     
     
@@ -91,9 +137,10 @@ def run(
     populate_func: PopulationFunc,
     fitness_func: FitnessFunc,
     fitness_limit: int,
-    selection_func: SelectionFunc = selection,
-    crossover_func: CrossoverFunc = single_point_crossover,
-    mutation_func: MutationFunc = mutation,
+    elitism: bool = True,
+    selection_func: SelectionFunc = roulette,
+    crossover_func: CrossoverFunc = k_point_crossover,
+    mutation_func: MutationFunc = flip_mutation,
     generation_limit: int = 100
 ) -> Tuple[Population, int]:
     population = populate_func()
@@ -108,13 +155,18 @@ def run(
         if fitness_func(population[0]) >= fitness_limit:
             break
         
-        next_generation = population[0:2]
+        next_generation = []
+
+        if elitism:
+            next_generation = population[0:2]
         
-        for _ in range(int(len(population) / 2) - 1):
+        for _ in range(int((len(population) - len(next_generation)) / 2)):
             parents = selection_func(population, fitness_func)
-            offspring_a, offspring_b = crossover_func(parents[0], parents[1])
+            offspring_a, offspring_b = crossover_func(parents[0], parents[1], 1)
             offspring_a = mutation_func(offspring_a)
+            offspring_a = inversion_mutation(offspring_a)
             offspring_b = mutation_func(offspring_b)
+            offspring_b = inversion_mutation(offspring_b)
             next_generation += [offspring_a, offspring_b]
             
         population = next_generation
@@ -130,7 +182,7 @@ def run(
 used_things = static_things
 average = 0
 
-for _ in range(0, 100):
+for _ in range(0, 1000):
     population, generations = run(
     populate_func=partial(
         generate_population, size=POPULATION_SIZE, genome_length=len(used_things)
@@ -143,5 +195,5 @@ for _ in range(0, 100):
     )
     average = average + generations
     
-average = average / 100
+average = average / 1000
 print(average)
