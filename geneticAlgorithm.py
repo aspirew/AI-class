@@ -12,33 +12,7 @@ CrossoverFunc = Callable[[Genome, Genome], Tuple[Genome, Genome]]
 MutationFunc = Callable[[Genome], Genome]
 Thing = namedtuple('Thing', ['value', 'weight'])
 
-# sums up to 1455 / 3648
-static_things = [
-    Thing(500, 2200),
-    Thing(150, 160),
-    Thing(100, 70),
-    Thing(500, 200),
-    Thing(10, 38),
-    Thing(5, 25),
-    Thing(40, 333),
-    Thing(15, 80),
-    Thing(60, 350),
-    Thing(30, 192),
-]
-
-POPULATION_SIZE = 10
-WEIGHT_LIMIT = 3000
-MAX_VALUE = 1000
-MAX_WEIGHT = 1000
-GENERATION_LIMIT = 1000
-FITNESS_LIMIT = 1300
-MUTATION_PROBABILITY = 1
-
-def generate_thing() -> Thing:
-    return Thing(randint(0, MAX_VALUE), randint(0, MAX_WEIGHT))
-
-def generate_things(size: int) -> List[Thing]:
-    return [generate_thing() for _ in range(size)]
+MUTATION_PROBABILITY = 0.7
 
 def generate_genome(lenght: int) -> Genome:
     return choices([0, 1], k=lenght)
@@ -50,22 +24,21 @@ def fitness(genome: Genome, things: List[Thing], weight_limit: int) -> int:
     if len(genome) != len(things):
         raise ValueError("genome and things must be of same size")
 
-    weight = 0
+    total_weight = 0
     value = 0
     
     for i, thing in enumerate(things):
-        if genome[i] == 1:
-            weight += thing.weight
-            value += thing.value
-            
-            if weight > weight_limit:
-                return 0            
+        value += thing.value * genome[i]
+        total_weight += thing.weight * genome[i]
+        
+        if total_weight > weight_limit:
+            return 0 
     return value
 
 def roulette(population: Population, fitness_func: FitnessFunc) -> Population:
     return choices(
         population=population,
-        weights=[fitness_func(genome) for genome in population],
+        weights=[fitness_func(genome)+1 for genome in population],
         k=2
     )
     
@@ -134,24 +107,29 @@ def inversion_mutation(genome: Genome, num: int = 1, probability: float = MUTATI
     
     
 def run(
-    populate_func: PopulationFunc,
-    fitness_func: FitnessFunc,
+    used_things: List[Thing],
     fitness_limit: int,
+    generation_limit: int,
+    weight_limit: int,
+    population_size: int,
     elitism: bool = True,
     selection_func: SelectionFunc = roulette,
     crossover_func: CrossoverFunc = k_point_crossover,
     mutation_func: MutationFunc = flip_mutation,
-    generation_limit: int = 100
 ) -> Tuple[Population, int]:
-    population = populate_func()
+    fitness_func = partial(
+        fitness, things=used_things, weight_limit=weight_limit
+    )
+    population = [generate_genome(len(used_things)) for _ in range(population_size)]
     
-    for i in range(generation_limit):
+    best_so_far = 0
+    
+    for i in range(generation_limit + 1):
         population = sorted(
             population,
             key = lambda genome: fitness_func(genome),
             reverse = True
-        )
-                        
+        )                        
         if fitness_func(population[0]) >= fitness_limit:
             break
         
@@ -159,7 +137,7 @@ def run(
 
         if elitism:
             next_generation = population[0:2]
-        
+                    
         for _ in range(int((len(population) - len(next_generation)) / 2)):
             parents = selection_func(population, fitness_func)
             offspring_a, offspring_b = crossover_func(parents[0], parents[1], 1)
@@ -171,29 +149,14 @@ def run(
             
         population = next_generation
         
+        if(best_so_far < fitness_func(population[0])):
+            best_so_far = fitness_func(population[0])
+            print(i, " -> ", best_so_far)
+        
     population = sorted(
         population,
         key = lambda genome: fitness_func(genome),
         reverse=True
     )
     
-    return population, i
-
-used_things = static_things
-average = 0
-
-for _ in range(0, 1000):
-    population, generations = run(
-    populate_func=partial(
-        generate_population, size=POPULATION_SIZE, genome_length=len(used_things)
-    ),
-    fitness_func=partial(
-        fitness, things=used_things, weight_limit=WEIGHT_LIMIT
-    ),
-    fitness_limit=FITNESS_LIMIT,
-    generation_limit=GENERATION_LIMIT
-    )
-    average = average + generations
-    
-average = average / 1000
-print(average)
+    return fitness_func(population[0],), i
