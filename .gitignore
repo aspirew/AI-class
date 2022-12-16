@@ -1,0 +1,5 @@
+face-recognition/application_data
+face-recognition/data
+face-recognition/lfw2
+face-recognition/training_checkpoints
+face-recognition/*.h5
