@@ -4,16 +4,15 @@ import time
 
 import cv2
 import os
-import random
 import numpy as np
-from matplotlib import pyplot as plt
 import uuid
 import keyboard
-
 # tensorflow deps
+
 from tensorflow import keras
 from keras.models import Model
 from keras.layers import Layer, Conv2D, Dense, MaxPooling2D, Input, Flatten
+from keras.metrics import Precision, Recall
 import tensorflow as tf
 
 POS_PATH = os.path.join('data', 'positive')
@@ -42,16 +41,29 @@ def create_dirs():
                 NEW_PATH = os.path.join(NEG_PATH, file)
                 os.replace(EX_PATH, NEW_PATH)
 
+def data_aug(img):
+    data = []
+    for _ in range(9):
+        img = tf.image.stateless_random_brightness(img, max_delta=0.02, seed=(1,2))
+        img = tf.image.stateless_random_contrast(img, lower=0.6, upper=1, seed=(1,3))
+        # img = tf.image.stateless_random_crop(img, size=(20,20,3), seed=(1,2))
+        img = tf.image.stateless_random_flip_left_right(img, seed=(np.random.randint(100),np.random.randint(100)))
+        img = tf.image.stateless_random_jpeg_quality(img, min_jpeg_quality=90, max_jpeg_quality=100, seed=(np.random.randint(100),np.random.randint(100)))
+        img = tf.image.stateless_random_saturation(img, lower=0.9,upper=1, seed=(np.random.randint(100),np.random.randint(100)))
+            
+        data.append(img)
+    
+    return data
 
 # webcam connection
 # different camera ID might be necessary
 def run_camera_for_collection():
     cap = cv2.VideoCapture(0)
     while cap.isOpened():
-        XD, frame = cap.read()
+        _, frame = cap.read()
 
         # cut image down to 250x250
-        frame = frame[0:250, 0:250, :]
+        frame = frame[350:350 + 250, 550:550 + 250, :]
         cv2.imshow('Image Collection', frame)
 
         # save anchor image with a press
@@ -70,11 +82,19 @@ def run_camera_for_collection():
     cap.release()
     cv2.destroyAllWindows()
 
+def add_augmented_images():
+    for file_name in os.listdir(os.path.join(POS_PATH)):
+        img_path = os.path.join(POS_PATH, file_name)
+        img = cv2.imread(img_path)
+        augmented_images = data_aug(img) 
+
+        for image in augmented_images:
+            cv2.imwrite(os.path.join(POS_PATH, '{}.jpg'.format(uuid.uuid1())), image.numpy())
 
 # function to create numpy equivalent of image
 def preprocess(file_path):
     byte_img = tf.io.read_file(file_path)
-    img = tf.io.decode_jpeg(byte_img, 3)
+    img = tf.io.decode_jpeg(byte_img)
     # resize value to 100x100 (as given in paper)
     img = tf.image.resize(img, (100, 100))
     # scale pixel value to be between 0 and 1
@@ -83,12 +103,9 @@ def preprocess(file_path):
 
 
 def preprocess_and_label_all_images():
-    anchor = tf.data.Dataset.list_files(ANC_PATH + '/*.jpg').take(100)
-    positive = tf.data.Dataset.list_files(POS_PATH + '/*.jpg').take(100)
-    negative = tf.data.Dataset.list_files(NEG_PATH + '/*.jpg').take(100)
-
-    dir_test = anchor.as_numpy_iterator()
-    dir_test.next()
+    anchor = tf.data.Dataset.list_files(ANC_PATH + '/*.jpg').take(1000)
+    positive = tf.data.Dataset.list_files(POS_PATH + '/*.jpg').take(1000)
+    negative = tf.data.Dataset.list_files(NEG_PATH + '/*.jpg').take(1000)
 
     positives = tf.data.Dataset.zip((anchor, positive, tf.data.Dataset.from_tensor_slices(tf.ones(len(anchor)))))
     negatives = tf.data.Dataset.zip((anchor, negative, tf.data.Dataset.from_tensor_slices(tf.zeros(len(anchor)))))
@@ -115,21 +132,27 @@ def preprocess_and_label_all_images():
 
 
 def make_embedding():
-    input = Input(shape=(100, 100, 3), name='input_image')
-    c1 = Conv2D(64, (10, 10), activation='relu')(input)
-    m1 = MaxPooling2D(64, (2, 2), padding='same')(c1)
-
-    c2 = Conv2D(128, (7, 7), activation='relu')(m1)
-    m2 = MaxPooling2D(64, (2, 2), padding='same')(c2)
-
-    c3 = Conv2D(128, (4, 4), activation='relu')(m2)
-    m3 = MaxPooling2D(64, (2, 2), padding='same')(c3)
-
-    c4 = Conv2D(256, (4, 4), activation='relu')(m3)
+    inp = Input(shape=(100,100,3), name='input_image')
+    
+    # First block
+    c1 = Conv2D(64, (10,10), activation='relu')(inp)
+    m1 = MaxPooling2D(64, (2,2), padding='same')(c1)
+    
+    # Second block
+    c2 = Conv2D(128, (7,7), activation='relu')(m1)
+    m2 = MaxPooling2D(64, (2,2), padding='same')(c2)
+    
+    # Third block 
+    c3 = Conv2D(128, (4,4), activation='relu')(m2)
+    m3 = MaxPooling2D(64, (2,2), padding='same')(c3)
+    
+    # Final embedding block
+    c4 = Conv2D(256, (4,4), activation='relu')(m3)
     f1 = Flatten()(c4)
     d1 = Dense(4096, activation='sigmoid')(f1)
-
-    return Model(inputs=[input], outputs=[d1], name='embedding')
+    
+    
+    return Model(inputs=[inp], outputs=[d1], name='embedding')
 
 
 class L1Dist(Layer):
@@ -142,15 +165,20 @@ class L1Dist(Layer):
 
 def make_siamese_model():
     embedding = make_embedding()
-    input_image = Input(name='input_img', shape=(100, 100, 3))
-    validation_image = Input(name='validation_img', shape=(100, 100, 3))
-
+    # Anchor image input in the network
+    input_image = Input(name='input_img', shape=(100,100,3))
+    
+    # Validation image in the network 
+    validation_image = Input(name='validation_img', shape=(100,100,3))
+    
+    # Combine siamese distance components
     siamese_layer = L1Dist()
     siamese_layer._name = 'distance'
     distances = siamese_layer(embedding(input_image), embedding(validation_image))
-
+    
+    # Classification layer 
     classifier = Dense(1, activation='sigmoid')(distances)
-
+    
     return Model(inputs=[input_image, validation_image], outputs=classifier, name='SiameseNetwork')
 
 
@@ -188,30 +216,44 @@ def training(train_data):
         return loss
 
     def train(data, EPOCHS):
-        for epoch in range(1, EPOCHS):
+        for epoch in range(1, EPOCHS+1):
             print('\n Epoch {}/{}'.format(epoch, EPOCHS))
             progbar = tf.keras.utils.Progbar(len(data))
-
+            
+            # Creating a metric object 
+            r = Recall()
+            p = Precision()
+            
+            # Loop through each batch
             for idx, batch in enumerate(data):
-                train_step(batch)
-                progbar.update(idx + 1)
-
-            if epoch % 10 == 0:
+                # Run train step here
+                loss = train_step(batch)
+                yhat = siamese_model.predict(batch[:2])
+                r.update_state(batch[2], yhat)
+                p.update_state(batch[2], yhat) 
+                progbar.update(idx+1)
+            print(loss.numpy(), r.result().numpy(), p.result().numpy())
+            
+            # Save checkpoints
+            if epoch % 10 == 0: 
                 checkpoint.save(file_prefix=checkpoint_prefix)
 
-    EPOCHS = 3
+    EPOCHS = 20
 
     train(train_data, EPOCHS)
     return siamese_model
 
 
 def evaluate(model, test_data):
-    from keras.metrics import Precision, Recall
-    test_input, test_val, y_true = test_data.as_numpy_iterator().next()
-    y_hat = model.predict([test_input, test_val])
-    m = Recall()
-    m.update_state(y_true, y_hat)
-    print(m.result().numpy())
+    r = Recall()
+    p = Precision()
+
+    for test_input, test_val, y_true in test_data.as_numpy_iterator():
+        yhat = model.predict([test_input, test_val])
+        r.update_state(y_true, yhat)
+        p.update_state(y_true,yhat) 
+
+    print(r.result().numpy(), p.result().numpy())
 
 
 def save_model(model, name):
@@ -223,24 +265,27 @@ def reload_model(filename):
                                                                 'BinaryCrossentropy': tf.losses.BinaryCrossentropy})
 
 
-def verify(model, detection_threshold, verification_treshold):
+def verify(model, detection_threshold, verification_threshold):
+    # Build results array
     results = []
-    for image in os.listdir(VER_IMAGE):
-        input_img = preprocess(os.path.join(INPUT_IMAGE, 'input_image.jpg'))
-        validation_img = preprocess(os.path.join(VER_IMAGE, image))
-
-        result = model.predict(list(np.expand_dims([input_img, validation_img], axis=1)), verbose=0)
-        # print(result)
+    for image in os.listdir(os.path.join('application_data', 'verification_images')):
+        input_img = preprocess(os.path.join('application_data', 'input_image', 'input_image.jpg'))
+        validation_img = preprocess(os.path.join('application_data', 'verification_images', image))
+        
+        # Make Predictions 
+        result = model.predict(list(np.expand_dims([input_img, validation_img], axis=1)))
         results.append(result)
-
-    # detection threshold: metric above which a prediciton is considered positive
+        print(results)
+    
+    # Detection Threshold: Metric above which a prediciton is considered positive 
     detection = np.sum(np.array(results) > detection_threshold)
-
-    verification = detection / len(os.listdir(VER_IMAGE))
-
-    # verification threshold: proportion of positive predicitons / total positive samples
-    verified = verification > verification_treshold
-
+    print(detection)
+    
+    # Verification Threshold: Proportion of positive predictions / total positive samples 
+    verification = detection / len(os.listdir(os.path.join('application_data', 'verification_images'))) 
+    print(verification)
+    verified = verification > verification_threshold
+    
     return results, verified
 
 
@@ -252,7 +297,7 @@ def real_time_verification(model):
     verified = False
     while cap.isOpened():
         ret, frame = cap.read()
-        frame = frame[0:250, 0:250, :]
+        frame = frame[350:350 + 250, 550:550 + 250, :]
 
         cv2.imshow('Verification', frame)
         cv2.setWindowProperty('Verification', cv2.WND_PROP_TOPMOST, 1)
@@ -262,7 +307,7 @@ def real_time_verification(model):
             print("Trwa weryfikacja...")
             cv2.imwrite(os.path.join('application_data', 'input_image', 'input_image.jpg'), frame)
             results, verified = verify(model, 0.5, 0.5)
-            # print(verified)
+            print(verified)
             if verified:
                 print("Udało się poprawnie zweryfikować twarz użytkownika")
                 return True
@@ -299,11 +344,11 @@ def main_program():
 main_program()
 # create_dirs()
 # run_camera_for_collection()
+# add_augmented_images()
 # train_data, test_data = preprocess_and_label_all_images()
 # model = training(train_data)
-# model = reload_model('mati.h5')
 
 # evaluate(model, test_data)
-# save_model(model, 'mati.h5')
+# save_model(model, 'rafal.h5')
 # model = reload_model('mati.h5')
 # real_time_verification(model)
