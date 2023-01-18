@@ -1,3 +1,4 @@
+import glob
 import logging
 import sys
 import time
@@ -11,9 +12,16 @@ import keyboard
 
 from tensorflow import keras
 from keras.models import Model
-from keras.layers import Layer, Conv2D, Dense, MaxPooling2D, Input, Flatten
+from keras.layers import Layer, Conv1D, Conv2D, Dense, MaxPooling2D, MaxPool1D, Input, Flatten
 from keras.metrics import Precision, Recall
 import tensorflow as tf
+
+import scipy.io.wavfile as wav
+from speechpy.feature import mfcc
+from speechpy.processing import cmvn
+
+import pyaudio
+import wave
 
 POS_PATH = os.path.join('data', 'positive')
 NEG_PATH = os.path.join('data', 'negative')
@@ -21,6 +29,9 @@ ANC_PATH = os.path.join('data', 'anchor')
 INPUT_IMAGE = os.path.join('application_data', 'input_image')
 VER_IMAGE = os.path.join('application_data', 'verification_images')
 
+POS_PATH_SOUND = os.path.join('sound_data', 'positive') 
+NEG_PATH_SOUND = os.path.join('sound_data', 'clips')
+ANC_PATH_SOUND = os.path.join('sound_data', 'anchor')
 
 def create_dirs():
     if (not os.path.exists(POS_PATH)):
@@ -29,16 +40,12 @@ def create_dirs():
         os.makedirs(NEG_PATH)
     if (not os.path.exists(ANC_PATH)):
         os.makedirs(ANC_PATH)
-    if (not os.path.exists(INPUT_IMAGE)):
-        os.makedirs(INPUT_IMAGE)
-    if (not os.path.exists(VER_IMAGE)):
-        os.makedirs(VER_IMAGE)
 
     if (os.path.exists('lfw')):
         for dir in os.listdir('lfw'):
-            for file in os.listdir(os.path.join('lfw', dir)):
-                EX_PATH = os.path.join('lfw', dir, file)
-                NEW_PATH = os.path.join(NEG_PATH, file)
+            for file in os.listdir(os.path.join(os.getcwd(), 'lfw', dir)):
+                EX_PATH = os.path.join(os.getcwd(), 'lfw', dir, file)
+                NEW_PATH = os.path.join(os.getcwd(), NEG_PATH, file)
                 os.replace(EX_PATH, NEW_PATH)
 
 def data_aug(img):
@@ -46,7 +53,6 @@ def data_aug(img):
     for _ in range(9):
         img = tf.image.stateless_random_brightness(img, max_delta=0.02, seed=(1,2))
         img = tf.image.stateless_random_contrast(img, lower=0.6, upper=1, seed=(1,3))
-        # img = tf.image.stateless_random_crop(img, size=(20,20,3), seed=(1,2))
         img = tf.image.stateless_random_flip_left_right(img, seed=(np.random.randint(100),np.random.randint(100)))
         img = tf.image.stateless_random_jpeg_quality(img, min_jpeg_quality=90, max_jpeg_quality=100, seed=(np.random.randint(100),np.random.randint(100)))
         img = tf.image.stateless_random_saturation(img, lower=0.9,upper=1, seed=(np.random.randint(100),np.random.randint(100)))
@@ -68,12 +74,12 @@ def run_camera_for_collection():
 
         # save anchor image with a press
         if cv2.waitKey(1) and keyboard.is_pressed('a'):
-            imgname = os.path.join(ANC_PATH, '{}.jpg'.format(uuid.uuid1()))
+            imgname = os.path.join(os.getcwd(), ANC_PATH, '{}.jpg'.format(uuid.uuid1()))
             cv2.imwrite(imgname, frame)
 
         # save positive image with p press
         if cv2.waitKey(1) and keyboard.is_pressed('p'):
-            imgname = os.path.join(POS_PATH, '{}.jpg'.format(uuid.uuid1()))
+            imgname = os.path.join(os.getcwd(), POS_PATH, '{}.jpg'.format(uuid.uuid1()))
             cv2.imwrite(imgname, frame)
 
         # quit with q press
@@ -83,13 +89,13 @@ def run_camera_for_collection():
     cv2.destroyAllWindows()
 
 def add_augmented_images():
-    for file_name in os.listdir(os.path.join(POS_PATH)):
-        img_path = os.path.join(POS_PATH, file_name)
+    for file_name in os.listdir(os.path.join(os.getcwd(), POS_PATH)):
+        img_path = os.path.join(os.getcwd(), POS_PATH, file_name)
         img = cv2.imread(img_path)
         augmented_images = data_aug(img) 
 
         for image in augmented_images:
-            cv2.imwrite(os.path.join(POS_PATH, '{}.jpg'.format(uuid.uuid1())), image.numpy())
+            cv2.imwrite(os.path.join(os.getcwd(), POS_PATH, '{}.jpg'.format(uuid.uuid1())), image.numpy())
 
 # function to create numpy equivalent of image
 def preprocess(file_path):
@@ -103,14 +109,14 @@ def preprocess(file_path):
 
 
 def preprocess_and_label_all_images():
-    anchor = tf.data.Dataset.list_files(ANC_PATH + '/*.jpg').take(1000)
-    positive = tf.data.Dataset.list_files(POS_PATH + '/*.jpg').take(1000)
-    negative = tf.data.Dataset.list_files(NEG_PATH + '/*.jpg').take(1000)
+    anchor = tf.data.Dataset.list_files(ANC_PATH + '/*.jpg').take(3000)
+    positive = tf.data.Dataset.list_files(POS_PATH + '/*.jpg').take(3000)
+    negative = tf.data.Dataset.list_files(NEG_PATH + '/*.jpg').take(3000)
 
     positives = tf.data.Dataset.zip((anchor, positive, tf.data.Dataset.from_tensor_slices(tf.ones(len(anchor)))))
     negatives = tf.data.Dataset.zip((anchor, negative, tf.data.Dataset.from_tensor_slices(tf.zeros(len(anchor)))))
     data = positives.concatenate(negatives)
-
+    
     def preprocess_twin(input_img, validation_img, label):
         return (preprocess(input_img), preprocess(validation_img), label)
 
@@ -131,7 +137,7 @@ def preprocess_and_label_all_images():
     return train_data, test_data
 
 
-def make_embedding():
+def make_embedding_for_image():
     inp = Input(shape=(100,100,3), name='input_image')
     
     # First block
@@ -163,13 +169,12 @@ class L1Dist(Layer):
         return tf.math.abs(input_embedding - validation_embedding)
 
 
-def make_siamese_model():
-    embedding = make_embedding()
+def make_siamese_model(embedding, shape):
     # Anchor image input in the network
-    input_image = Input(name='input_img', shape=(100,100,3))
+    input_image = Input(name='input_img', shape=shape)
     
     # Validation image in the network 
-    validation_image = Input(name='validation_img', shape=(100,100,3))
+    validation_image = Input(name='validation_img', shape=shape)
     
     # Combine siamese distance components
     siamese_layer = L1Dist()
@@ -182,8 +187,8 @@ def make_siamese_model():
     return Model(inputs=[input_image, validation_image], outputs=classifier, name='SiameseNetwork')
 
 
-def training(train_data):
-    siamese_model = make_siamese_model()
+def training(train_data, embedding, shape):
+    siamese_model = make_siamese_model(embedding, shape)
     binary_cross_loss = tf.losses.BinaryCrossentropy()
     opt = tf.keras.optimizers.Adam(1e-4)
     checkpoint_dir = './training_checkpoints'
@@ -195,7 +200,6 @@ def training(train_data):
 
     @tf.function
     def train_step(batch):
-
         with tf.GradientTape() as tape:
             # get anchor and positive/negative image
             x = batch[:2]
@@ -238,7 +242,7 @@ def training(train_data):
             if epoch % 10 == 0: 
                 checkpoint.save(file_prefix=checkpoint_prefix)
 
-    EPOCHS = 20
+    EPOCHS = 50
 
     train(train_data, EPOCHS)
     return siamese_model
@@ -265,31 +269,28 @@ def reload_model(filename):
                                                                 'BinaryCrossentropy': tf.losses.BinaryCrossentropy})
 
 
-def verify(model, detection_threshold, verification_threshold):
+def verify(model, detection_threshold, verification_threshold, login):
     # Build results array
     results = []
-    for image in os.listdir(os.path.join('application_data', 'verification_images')):
-        input_img = preprocess(os.path.join('application_data', 'input_image', 'input_image.jpg'))
-        validation_img = preprocess(os.path.join('application_data', 'verification_images', image))
+    for image in os.listdir(os.path.join(os.getcwd(), 'application_data', login, 'verification_images')):
+        input_img = preprocess(os.path.join(os.getcwd(), 'application_data', login, 'input_image', 'input_image.jpg'))
+        validation_img = preprocess(os.path.join(os.getcwd(), 'application_data', login, 'verification_images', image))
         
         # Make Predictions 
-        result = model.predict(list(np.expand_dims([input_img, validation_img], axis=1)))
+        result = model.predict(list(np.expand_dims([input_img, validation_img], axis=1)), verbose = 0)
         results.append(result)
-        print(results)
     
     # Detection Threshold: Metric above which a prediciton is considered positive 
     detection = np.sum(np.array(results) > detection_threshold)
-    print(detection)
     
     # Verification Threshold: Proportion of positive predictions / total positive samples 
-    verification = detection / len(os.listdir(os.path.join('application_data', 'verification_images'))) 
-    print(verification)
+    verification = detection / len(os.listdir(os.path.join(os.getcwd(), 'application_data', login, 'verification_images'))) 
     verified = verification > verification_threshold
     
     return results, verified
 
 
-def real_time_verification(model):
+def real_time_verification(model, login):
     cap = cv2.VideoCapture(0)
     print("Ustaw się tak, żeby twoja twarz była widoczna w oknie kamerki widocznym na ekranie")
     print("Kiedy będziesz gotowy, wciśnij przycisk v, w celu weryfikacji...")
@@ -305,9 +306,8 @@ def real_time_verification(model):
         # trigger verification on 'v' press
         if cv2.waitKey(10) and keyboard.is_pressed('v'):
             print("Trwa weryfikacja...")
-            cv2.imwrite(os.path.join('application_data', 'input_image', 'input_image.jpg'), frame)
-            results, verified = verify(model, 0.5, 0.5)
-            print(verified)
+            cv2.imwrite(os.path.join(os.getcwd(), 'application_data', login, 'input_image', 'input_image.jpg'), frame)
+            results, verified = verify(model, 0.5, 0.5, login)
             if verified:
                 print("Udało się poprawnie zweryfikować twarz użytkownika")
                 return True
@@ -323,32 +323,182 @@ def real_time_verification(model):
     cv2.destroyAllWindows()
     return verified
 
+def preprocess_sound(sound):
+    rate, sig = wav.read(sound)
+    mfcc_feat = mfcc(sig,rate, fft_length=2048)
+    norm_features = cmvn(mfcc_feat)
+    return tf.convert_to_tensor(norm_features[20:290])
+
+def preprocess_and_label_all_sounds():
+    anchor = [f for f in glob.glob(ANC_PATH_SOUND + "/*.wav")]
+    positive = [f for f in glob.glob(POS_PATH_SOUND + "/*.wav")]
+    negative = [f for f in glob.glob(NEG_PATH_SOUND + "/*.wav")]
+    negative = negative[:50]
+        
+    def preprocess_all_sounds(list_of_sounds):
+        values = []
+        for sound in list_of_sounds:
+            values.append(preprocess_sound(sound))
+        return values
+    
+    processed_anchor = tf.data.Dataset.from_tensor_slices(preprocess_all_sounds(anchor))
+    processed_positive = tf.data.Dataset.from_tensor_slices(preprocess_all_sounds(positive))
+    processed_negative = tf.data.Dataset.from_tensor_slices(preprocess_all_sounds(negative))
+        
+    positives = tf.data.Dataset.zip((processed_anchor, processed_positive, tf.data.Dataset.from_tensor_slices(tf.ones(len(anchor)))))
+    negatives = tf.data.Dataset.zip((processed_anchor, processed_negative, tf.data.Dataset.from_tensor_slices(tf.zeros(len(anchor)))))
+    data = positives.concatenate(negatives)
+    
+    # preprocess all images and shuffle negatives with positives
+    data = data.cache()
+    data = data.shuffle(buffer_size=1024)
+
+    train_data = data.take(round(len(data) * .7))
+    train_data = train_data.batch(16)
+    train_data = train_data.prefetch(8)
+
+    test_data = data.skip(round(len(data) * .7))
+    test_data = test_data.take(round(len(data) * .3))
+    test_data = test_data.batch(16)
+    test_data = test_data.prefetch(8)
+
+    return train_data, test_data
+
+
+def make_embedding_for_recording():
+    inp = Input(shape=(270,13), name='input_sample')
+    
+    # First block
+    c1 = Conv1D(64, 10, activation='relu')(inp)
+    m1 = MaxPool1D(64, 2, padding='same')(c1)
+    
+    # Second block
+    c2 = Conv1D(128, 7, activation='relu')(m1)
+    m2 = MaxPool1D(64, 2, padding='same')(c2)
+    
+    # Third block 
+    c3 = Conv1D(128, 4, activation='relu')(m2)
+    m3 = MaxPool1D(64, 2, padding='same')(c3)
+    
+    # Final embedding block
+    c4 = Conv1D(256, 4, activation='relu')(m3)
+    f1 = Flatten()(c4)
+    d1 = Dense(4096, activation='sigmoid')(f1)
+    
+    return Model(inputs=[inp], outputs=[d1], name='embedding')
+
+def verify_sound(model, detection_threshold, verification_threshold, login):
+    # Build results array
+    results = []
+    for sound in os.listdir(os.path.join(os.getcwd(), 'application_data', login, 'verification_sounds')):
+        input_sound = preprocess_sound(os.path.join(os.getcwd(), 'application_data', login, 'input_sound', 'input_sound.wav'))
+        validation_sound = preprocess_sound(os.path.join(os.getcwd(), 'application_data', login, 'verification_sounds', sound))
+        
+        # Make Predictions 
+        result = model.predict(list(np.expand_dims([input_sound, validation_sound], axis=1)), verbose = 0)
+        results.append(result)
+    
+    # Detection Threshold: Metric above which a prediciton is considered positive 
+    detection = np.sum(np.array(results) > detection_threshold)
+    
+    # Verification Threshold: Proportion of positive predictions / total positive samples 
+    verification = detection / len(os.listdir(os.path.join(os.getcwd(), 'application_data', login, 'verification_sounds'))) 
+    verified = verification > verification_threshold
+    
+    return results, verified
+
+def real_time_sound_verification(model, login):
+    
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 44100
+    CHUNK = 1024
+    RECORD_SECONDS = 3
+    
+    print("Kiedy będziesz gotowy, mów do mikrofonu głośno i wyraźnie przez około 3 sekundy")
+    print("Wciśnij jednokrotnie przycisk v, a aplikacja zacznie rejestrować dźwięk...")
+    chances = 0
+    verified = False
+    while chances < 3:
+        # trigger recording on 'v' press
+        if keyboard.is_pressed('v'):
+            audio = pyaudio.PyAudio()
+            stream = audio.open(format=FORMAT, channels=CHANNELS,
+                rate=RATE, input=True,
+                frames_per_buffer=CHUNK)
+            print("Trwa nagrywanie...")
+            frames = []
+            
+            for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
+                data = stream.read(CHUNK)
+                frames.append(data)
+                
+            stream.stop_stream()
+            stream.close()
+            audio.terminate()
+            
+            waveFile = wave.open(os.path.join(os.getcwd(), 'application_data', login, 'input_sound', 'input_sound.wav'), 'wb')
+            waveFile.setnchannels(CHANNELS)
+            waveFile.setsampwidth(audio.get_sample_size(FORMAT))
+            waveFile.setframerate(RATE)
+            waveFile.writeframes(b''.join(frames))
+            waveFile.close()
+            print("Nagrywanie zakończone. Trwa weryfikacja...")
+            
+            results, verified = verify_sound(model, 0.5, 0.5, login)
+            if verified:
+                print("Udało się poprawnie zweryfikować głos użytkownika!")
+                return True
+            else:
+                chances += 1
+                print(f'Nie udało się poprawnie zweryfikować danego użytkownika, wykorzystane szanse {chances}/3')
+                print("Kiedy będziesz gotowy, mów do mikrofonu głośno i wyraźnie przez około 3 sekundy")
+                print("Wciśnij jednokrotnie przycisk v, a aplikacja zacznie rejestrować dźwięk...")
+            if chances == 3:
+                print("Przekroczono dostępną liczbę prób")
+                return False
+    return verified
 
 def main_program():
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # FATAL
     logging.getLogger('tensorflow').setLevel(logging.FATAL)
     print("Cześć!")
     login = ""
-    while not os.path.exists(f'{login}.h5'):
+    while not os.path.exists(os.path.join(os.getcwd(), 'models', login, 'image.h5')):
         login = input("Wprowadź swój login: ")
-        if not os.path.exists(f'{login}.h5'):
+        if not os.path.exists(os.path.join(os.getcwd(),'models', login, 'image.h5')):
             print("Podano niepoprawny login")
-    model = reload_model(f'{login}.h5')
+    modelImage = reload_model(os.path.join(os.getcwd(), 'models', login, 'image.h5'))
+    modelSound = reload_model(os.path.join(os.getcwd(), 'models', login, 'sound.h5'))
     print("Za 3 sekundy nastąpi uruchomienie kamery")
     for i in reversed(range(3)):
         print(i + 1)
         time.sleep(1)
-    real_time_verification(model)
-
+    if real_time_verification(modelImage, login):
+        if real_time_sound_verification(modelSound, login):
+            print(f"Witaj {login}!")
+            print("Nastąpi zamknięcie aplikacji...")
+            return
+    print("Niepowodzenie logowania!")
+    print("Nastąpi zamknięcie aplikacji...")
 
 main_program()
 # create_dirs()
 # run_camera_for_collection()
 # add_augmented_images()
 # train_data, test_data = preprocess_and_label_all_images()
-# model = training(train_data)
+# model = training(train_data, make_embedding_for_image(), (100, 100, 3))
 
 # evaluate(model, test_data)
-# save_model(model, 'rafal.h5')
+# save_model(model, 'rafal2.h5')
 # model = reload_model('mati.h5')
 # real_time_verification(model)
+
+# train_data, test_data = preprocess_and_label_all_sounds()
+# model = training(train_data, make_embedding_for_recording(), (270,13))
+# evaluate(model, test_data)
+# save_model(model, 'rafal_sound2.h5')
+# model = reload_model('rafal_sound2.h5')
+# print(verify_sound(model, 0.5, 0.5))
+# train_data = preprocess_and_label_sounds(os.path.join(NEG_PATH_SOUND, 'common_voice_pl_34938116.mp3'))
+# training(train_data, make_embedding_for_recording(), (292, 13))

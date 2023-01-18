@@ -3,3 +3,5 @@ face-recognition/data
 face-recognition/lfw
 face-recognition/training_checkpoints
 face-recognition/*.h5
+face-recognition/models
+face-recognition/sound_data
